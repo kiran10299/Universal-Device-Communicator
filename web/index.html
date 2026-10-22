@@ -96,10 +96,11 @@ button,input,select,textarea{font-family:inherit;color:inherit}
 .vision-stage{display:none;grid-template-columns:1.25fr 1fr;gap:.9rem;margin-top:.4rem}
 .vision-stage.active{display:grid}
 @media(max-width:720px){.vision-stage{grid-template-columns:1fr}}
-.cam-canvas-wrap{background:#04070f;border:1px solid var(--border);border-radius:10px;position:relative;overflow:hidden;min-height:240px;display:grid;place-items:center}
-#camCanvas{width:100%;height:auto;display:block;cursor:crosshair}
-#camVideo{display:none}
-.cam-hud{position:absolute;top:8px;left:8px;right:8px;display:flex;justify-content:space-between;pointer-events:none;font-family:'JetBrains Mono',monospace;font-size:.7rem}
+.cam-canvas-wrap{background:#04070f;border:1px solid var(--border);border-radius:10px;position:relative;overflow:hidden;min-height:240px;aspect-ratio:16/9;display:grid;place-items:center}
+#camVideo{display:none; position:absolute; inset:0; width:100%; height:100%; object-fit:contain; background:#000; z-index:1; transform:translateZ(0)}
+#camVideo.live{display:block}
+#camCanvas{width:100%; height:100%; display:block; cursor:crosshair; position:relative; z-index:2; pointer-events:auto}
+.cam-hud{position:absolute;top:8px;left:8px;right:8px;display:flex;justify-content:space-between;pointer-events:none;font-family:'JetBrains Mono',monospace;font-size:.7rem;z-index:3}
 .cam-hud span{background:rgba(6,10,20,.82);padding:.2rem .5rem;border-radius:6px;border:1px solid var(--border);color:var(--c1)}
 
 /* Right Column: Protocol Inspector / Register Map / Pinout */
@@ -201,9 +202,12 @@ button,input,select,textarea{font-family:inherit;color:inherit}
     <div class="card-box vision-stage" id="visionStage">
       <div>
         <div class="box-head" style="margin-bottom:.5rem">
-          <div class="box-title"><i class="fas fa-video"></i> Live Camera Stream (USB / DirectShow / TCP Frame)</div>
-          <div style="display:flex;gap:.4rem">
-            <button class="btn-sm" id="startUsbCamBtn" title="Connect real physical USB / DirectShow camera via browser"><i class="fas fa-camera"></i> Connect Real USB Cam</button>
+          <div class="box-title"><i class="fas fa-video"></i> Live Camera Stream (USB / DirectShow / TCP)</div>
+          <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+            <select id="usbCamDeviceSelect" title="Select physical USB / DirectShow camera device" style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:.32rem .5rem;font-size:.73rem;font-family:'JetBrains Mono',monospace;max-width:175px">
+              <option value="">Default USB Camera</option>
+            </select>
+            <button class="btn-sm btn-primary" id="startUsbCamBtn" title="Connect real physical USB / DirectShow camera via browser"><i class="fas fa-camera"></i> Connect Real USB Cam</button>
             <button class="btn-sm" id="snapCamBtn"><i class="fas fa-download"></i> Snapshot</button>
           </div>
         </div>
@@ -562,13 +566,26 @@ button,input,select,textarea{font-family:inherit;color:inherit}
     if (!inp) return;
     const v = parseInt(inp.value, 10) || 0;
     registers[idx].val = v & 0xFFFF;
-    const hi = (registers[idx].val >> 8) & 0xFF;
-    const lo = registers[idx].val & 0xFF;
-    const frame = [0x01, 0x06, 0x00, idx, hi, lo];
-    const crc = crc16Modbus(frame);
-    frame.push(crc & 0xFF, (crc >> 8) & 0xFF);
-    logPacket('TX', currentProto, frame, `Write Register 4000${idx+1} = ${v}`);
-    logPacket('RX', currentProto, frame, `ACK Register 4000${idx+1} Updated`);
+    const hi = ((registers[idx].val >> 8) & 0xFF).toString(16).toUpperCase().padStart(2, '0');
+    const lo = (registers[idx].val & 0xFF).toString(16).toUpperCase().padStart(2, '0');
+    const addrLo = (idx & 0xFF).toString(16).toUpperCase().padStart(2, '0');
+    if (currentProto === 'MODBUS_TCP') {
+      document.getElementById('payloadFormat').value = 'HEX';
+      document.getElementById('checksumMode').value = 'NONE';
+      document.getElementById('cmdInput').value = `00 01 00 00 00 06 01 06 00 ${addrLo} ${hi} ${lo}`;
+      executeTransaction('QUERY');
+    } else if (currentProto === 'MODBUS_RTU') {
+      document.getElementById('payloadFormat').value = 'HEX';
+      document.getElementById('checksumMode').value = 'CRC16';
+      document.getElementById('cmdInput').value = `01 06 00 ${addrLo} ${hi} ${lo}`;
+      executeTransaction('QUERY');
+    } else {
+      const frame = [0x01, 0x06, 0x00, idx, (registers[idx].val >> 8) & 0xFF, registers[idx].val & 0xFF];
+      const crc = crc16Modbus(frame);
+      frame.push(crc & 0xFF, (crc >> 8) & 0xFF);
+      logPacket('TX', 'MODBUS_RTU', frame, `Write Register 4000${idx+1} = ${v}`);
+      logPacket('RX', 'MODBUS_RTU', frame, `ACK Register 4000${idx+1} Updated`);
+    }
     renderRegisters();
   };
 
@@ -741,15 +758,121 @@ button,input,select,textarea{font-family:inherit;color:inherit}
     return {bytes: Array.from(msg).map(c => c.charCodeAt(0)), note: 'Device Response'};
   }
 
+  // Read active form configuration values for current protocol
+  function getFormConfig() {
+    const cfg = PROTOCOLS[currentProto];
+    const out = {};
+    if (cfg && cfg.fields) {
+      cfg.fields.forEach(f => {
+        const el = document.getElementById('cfg_' + f.id);
+        if (el) out[f.id] = el.value;
+      });
+    }
+    return out;
+  }
+
+  let webSerialReader = null;
+  let webSerialRxQueue = [];
+
+  async function openWebSerialHardware() {
+    if (!('serial' in navigator)) {
+      logPacket('RX', currentProto, [], 'WebSerial not supported in this browser (use Chrome or Edge)');
+      return false;
+    }
+    try {
+      const fcfg = getFormConfig();
+      const baud = parseInt(fcfg.baud || fcfg.bitrate || '115200', 10) || 115200;
+      const framing = (fcfg.framing || '8N1').toUpperCase();
+      const dataBits = framing.startsWith('7') ? 7 : 8;
+      const parity = framing.includes('E') ? 'even' : (framing.includes('O') ? 'odd' : 'none');
+      const stopBits = framing.endsWith('2') ? 2 : 1;
+
+      if (webSerialReader) {
+        try { await webSerialReader.cancel(); } catch (e) {}
+        webSerialReader = null;
+      }
+      if (webSerialPort) {
+        try { await webSerialPort.close(); } catch (e) {}
+      }
+
+      webSerialPort = await navigator.serial.requestPort();
+      await webSerialPort.open({ baudRate: baud, dataBits, parity, stopBits });
+      document.getElementById('connText').textContent = `WEBSERIAL OPEN (${baud} ${framing})`;
+
+      // If CAN SLCAN adapter, initialize bitrate and open channel
+      if (currentProto === 'CAN' && webSerialPort.writable) {
+        const slcanMap = {'125':'S4','250':'S5','500':'S6','1000':'S8'};
+        const bKey = String(fcfg.bitrate || '500').split(' ')[0];
+        const sCmd = `C\r${slcanMap[bKey] || 'S6'}\rO\r`;
+        const w = webSerialPort.writable.getWriter();
+        await w.write(new TextEncoder().encode(sCmd));
+        w.releaseLock();
+      }
+
+      // Start continuous background hardware reader loop
+      readWebSerialLoop();
+      return true;
+    } catch (e) {
+      logPacket('RX', currentProto, [], 'WebSerial Connect Note: ' + e.message);
+      return false;
+    }
+  }
+
+  async function readWebSerialLoop() {
+    while (webSerialPort && webSerialPort.readable) {
+      webSerialReader = webSerialPort.readable.getReader();
+      try {
+        while (true) {
+          const { value, done } = await webSerialReader.read();
+          if (done) break;
+          if (value && value.length) {
+            const arr = Array.from(value);
+            webSerialRxQueue.push(...arr);
+          }
+        }
+      } catch (err) {
+        break;
+      } finally {
+        if (webSerialReader) {
+          try { webSerialReader.releaseLock(); } catch (e) {}
+          webSerialReader = null;
+        }
+      }
+    }
+  }
+
+  function decodeAndInspectRx(rxBytes, sourceNote) {
+    if (!rxBytes || !rxBytes.length) return;
+    // Update holding register table if Modbus RTU or Modbus TCP Read Holding/Input response
+    if (currentProto === 'MODBUS_RTU' && rxBytes.length >= 5 && (rxBytes[1] === 3 || rxBytes[1] === 4)) {
+      const byteCount = rxBytes[2];
+      const regCount = Math.min(registers.length, Math.floor(byteCount / 2));
+      for (let i = 0; i < regCount; i++) {
+        registers[i].val = (rxBytes[3 + i * 2] << 8) | rxBytes[4 + i * 2];
+      }
+      renderRegisters();
+    } else if (currentProto === 'MODBUS_TCP' && rxBytes.length >= 9 && (rxBytes[7] === 3 || rxBytes[7] === 4)) {
+      const byteCount = rxBytes[8];
+      const regCount = Math.min(registers.length, Math.floor(byteCount / 2));
+      for (let i = 0; i < regCount; i++) {
+        registers[i].val = (rxBytes[9 + i * 2] << 8) | rxBytes[10 + i * 2];
+      }
+      renderRegisters();
+    }
+    logPacket('RX', currentProto, rxBytes, sourceNote);
+  }
+
   async function executeTransaction(type) {
     const t0 = performance.now();
     const txBytes = buildTxBytes();
     updateCodeSnippet();
 
-    if (type === 'WRITE' || type === 'QUERY') {
-      logPacket('TX', currentProto, txBytes, type === 'QUERY' ? 'Query Request' : 'Write Payload');
-      if (hwMode === 'WEBHW' && webSerialPort && webSerialPort.writable) {
+    // 1. Direct Browser WebSerial Hardware Mode
+    if (hwMode === 'WEBHW' && webSerialPort && webSerialPort.writable) {
+      if (type === 'WRITE' || type === 'QUERY') {
+        logPacket('TX', currentProto, txBytes, type === 'QUERY' ? 'WebSerial Hardware Query' : 'WebSerial Hardware Write');
         try {
+          webSerialRxQueue = [];
           const writer = webSerialPort.writable.getWriter();
           await writer.write(new Uint8Array(txBytes));
           writer.releaseLock();
@@ -757,32 +880,64 @@ button,input,select,textarea{font-family:inherit;color:inherit}
           logPacket('RX', currentProto, [], 'WebSerial Write Error: ' + err.message);
         }
       }
+      if (type === 'READ' || type === 'QUERY') {
+        // Wait up to 350ms for physical serial device bytes to arrive in webSerialRxQueue
+        let waited = 0;
+        while (webSerialRxQueue.length === 0 && waited < 350) {
+          await new Promise(r => setTimeout(r, 15));
+          waited += 15;
+        }
+        // Drain any remaining bytes in the frame
+        if (webSerialRxQueue.length > 0) {
+          await new Promise(r => setTimeout(r, 20));
+          const rxBytes = webSerialRxQueue.splice(0, webSerialRxQueue.length);
+          decodeAndInspectRx(rxBytes, 'Physical WebSerial RX');
+        } else {
+          logPacket('RX', currentProto, [], 'WebSerial Read Timeout (0 bytes received)');
+        }
+      }
+      document.getElementById('statLatency').textContent = (performance.now() - t0).toFixed(2) + ' ms';
+      return;
     }
 
-    if (type === 'READ' || type === 'QUERY') {
-      if (hwMode === 'BRIDGE') {
-        try {
-          const r = await fetch('http://127.0.0.1:8765', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-              action: 'transceive',
-              data: document.getElementById('cmdInput').value,
-              mode: document.getElementById('payloadFormat').value
-            })
-          });
-          const j = await r.json();
-          if (j.rx) {
-            logPacket('RX', currentProto, hexToBytes(j.rx.hex), 'Local Bridge Hardware RX');
-          }
-        } catch (e) {
-          const sim = simulateDeviceResponse(txBytes);
-          logPacket('RX', currentProto, sim.bytes, sim.note + ' (Bridge Fallback)');
-        }
-      } else {
-        const sim = simulateDeviceResponse(txBytes);
-        logPacket('RX', currentProto, sim.bytes, sim.note);
+    // 2. Local OS Hardware Bridge Mode (127.0.0.1:8765)
+    if (hwMode === 'BRIDGE') {
+      if (type === 'WRITE' || type === 'QUERY') {
+        logPacket('TX', currentProto, txBytes, type === 'QUERY' ? 'Bridge Hardware Query' : 'Bridge Hardware Write');
       }
+      try {
+        const actionName = type === 'WRITE' ? 'write' : (type === 'READ' ? 'read' : 'transceive');
+        const r = await fetch('http://127.0.0.1:8765', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            action: actionName,
+            raw_hex: bytesToHex(txBytes),
+            data: document.getElementById('cmdInput').value,
+            mode: document.getElementById('payloadFormat').value
+          })
+        });
+        const j = await r.json();
+        if (j.error) {
+          logPacket('RX', currentProto, [], 'Bridge Hardware Error: ' + j.error);
+        } else if (j.rx && j.rx.hex !== undefined) {
+          decodeAndInspectRx(hexToBytes(j.rx.hex), 'Local OS Bridge Hardware RX');
+        }
+      } catch (e) {
+        const sim = simulateDeviceResponse(txBytes);
+        decodeAndInspectRx(sim.bytes, sim.note + ' (Bridge Offline -> Simulator Fallback)');
+      }
+      document.getElementById('statLatency').textContent = (performance.now() - t0).toFixed(2) + ' ms';
+      return;
+    }
+
+    // 3. Virtual Hardware Simulator Mode
+    if (type === 'WRITE' || type === 'QUERY') {
+      logPacket('TX', currentProto, txBytes, type === 'QUERY' ? 'Query Request' : 'Write Payload');
+    }
+    if (type === 'READ' || type === 'QUERY') {
+      const sim = simulateDeviceResponse(txBytes);
+      decodeAndInspectRx(sim.bytes, sim.note);
     }
 
     const dt = (performance.now() - t0 + 0.35).toFixed(2);
@@ -865,47 +1020,215 @@ button,input,select,textarea{font-family:inherit;color:inherit}
     updateCodeSnippet();
   }
   document.getElementById('modeSimBtn').addEventListener('click', () => setHwMode('SIM'));
-  document.getElementById('modeBridgeBtn').addEventListener('click', () => setHwMode('BRIDGE'));
+  document.getElementById('modeBridgeBtn').addEventListener('click', async () => {
+    setHwMode('BRIDGE');
+    await connectActiveProtocolHardware();
+  });
   document.getElementById('modeWebHwBtn').addEventListener('click', async () => {
     setHwMode('WEBHW');
-    if ('serial' in navigator && (currentProto === 'RS232' || currentProto === 'MODBUS_RTU' || currentProto === 'CAN')) {
-      try {
-        webSerialPort = await navigator.serial.requestPort();
-        await webSerialPort.open({baudRate: 115200});
-        document.getElementById('connText').textContent = 'WEBSERIAL PORT OPEN (115200)';
-      } catch (e) {
-        // User cancelled prompt or no device plugged; keep ready
-      }
+    if (currentProto === 'CAMERA') {
+      await startRealUsbCamera(document.getElementById('usbCamDeviceSelect').value);
+    } else if (currentProto === 'RS232' || currentProto === 'MODBUS_RTU' || currentProto === 'CAN') {
+      await openWebSerialHardware();
     }
   });
 
-  document.getElementById('connectBtn').addEventListener('click', () => {
+  async function connectActiveProtocolHardware() {
     const p = PROTOCOLS[currentProto];
+    const fcfg = getFormConfig();
+    if (currentProto === 'CAMERA' && (hwMode === 'WEBHW' || usingRealWebcam)) {
+      await startRealUsbCamera(document.getElementById('usbCamDeviceSelect').value);
+      return;
+    }
+    if (hwMode === 'WEBHW' && (currentProto === 'RS232' || currentProto === 'MODBUS_RTU' || currentProto === 'CAN')) {
+      await openWebSerialHardware();
+      return;
+    }
+    if (hwMode === 'BRIDGE') {
+      const ep = fcfg.host ? (fcfg.port ? `${fcfg.host}:${fcfg.port}` : fcfg.host) : (fcfg.com || fcfg.iface || fcfg.src || fcfg.camid || '127.0.0.1:5025');
+      try {
+        const r = await fetch('http://127.0.0.1:8765', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            action: 'connect',
+            protocol: currentProto,
+            endpoint: ep,
+            simulate: false,
+            config: {
+              host: fcfg.host,
+              port: fcfg.port,
+              baudrate: fcfg.baud,
+              framing: fcfg.framing,
+              bitrate: fcfg.bitrate,
+              timeout: fcfg.timeout ? parseFloat(fcfg.timeout) / 1000 : 2.0
+            }
+          })
+        });
+        const j = await r.json();
+        if (j.status === 'CONNECTED') {
+          document.getElementById('connText').textContent = `BRIDGE CONNECTED (${ep})`;
+          logPacket('RX', currentProto, [0x41, 0x43, 0x4B], `Connected to Real Hardware via Bridge -> ${ep}`);
+          return;
+        } else if (j.error) {
+          logPacket('RX', currentProto, [0x45, 0x52, 0x52], `Bridge Connect Error: ${j.error}`);
+          return;
+        }
+      } catch (err) {
+        logPacket('RX', currentProto, [0x45, 0x52, 0x52], `Local Bridge (:8765) not running — run "python omnicomm_cli.py --serve"`);
+        return;
+      }
+    }
     logPacket('TX', currentProto, [0x53, 0x59, 0x4E], `Session Connected -> ${p.title}`);
+  }
+
+  document.getElementById('connectBtn').addEventListener('click', connectActiveProtocolHardware);
+
+  // =========================================================================
+  // INSTANT ZERO-LAG CAMERA & VISION ENGINE (Direct GPU <video> + Overlay)
+  // =========================================================================
+  const camCanvas = document.getElementById('camCanvas');
+  const camCtx = camCanvas.getContext('2d', { willReadFrequently: true });
+  const camVideo = document.getElementById('camVideo');
+  const usbCamSelect = document.getElementById('usbCamDeviceSelect');
+  const startUsbCamBtn = document.getElementById('startUsbCamBtn');
+
+  // Offscreen 1x1 pixel sampler for zero-lag RGB inspection on live video
+  const sampleCanvas = document.createElement('canvas');
+  sampleCanvas.width = 1;
+  sampleCanvas.height = 1;
+  const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+  let lastMouseSampleTime = 0;
+
+  async function refreshCameraDevices() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const vids = devices.filter(d => d.kind === 'videoinput');
+      if (vids.length > 0) {
+        const currentVal = usbCamSelect.value;
+        usbCamSelect.innerHTML = vids.map((d, i) =>
+          `<option value="${d.deviceId}">${d.label || ('USB Camera #' + (i + 1))}</option>`
+        ).join('');
+        if (currentVal && vids.some(d => d.deviceId === currentVal)) {
+          usbCamSelect.value = currentVal;
+        }
+      }
+    } catch (e) {}
+  }
+
+  function drawReticleOverlayOnly() {
+    const w = camCanvas.width, h = camCanvas.height;
+    camCtx.clearRect(0, 0, w, h);
+    if (!showReticle) return;
+    camCtx.strokeStyle = 'rgba(244,114,182,0.75)';
+    camCtx.lineWidth = 1.2;
+    camCtx.beginPath();
+    camCtx.moveTo(w / 2, 0); camCtx.lineTo(w / 2, h);
+    camCtx.moveTo(0, h / 2); camCtx.lineTo(w, h / 2);
+    camCtx.stroke();
+    camCtx.beginPath();
+    camCtx.arc(w / 2, h / 2, 36, 0, Math.PI * 2);
+    camCtx.stroke();
+  }
+
+  function stopRealUsbCamera() {
+    if (camVideo.srcObject) {
+      camVideo.srcObject.getTracks().forEach(t => t.stop());
+      camVideo.srcObject = null;
+    }
+    camVideo.classList.remove('live');
+    usingRealWebcam = false;
+    startUsbCamBtn.innerHTML = '<i class="fas fa-camera"></i> Connect Real USB Cam';
+    startUsbCamBtn.classList.add('btn-primary');
+    document.getElementById('camModeHud').textContent = 'MODE: SYNTHETIC DIRECTSHOW / TCP STREAM (640x360)';
+  }
+
+  async function startRealUsbCamera(deviceId) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      logPacket('RX', 'CAMERA_USB', [0x45, 0x52, 0x52], 'Browser WebRTC getUserMedia not available');
+      return;
+    }
+    try {
+      // Stop any existing stream tracks before opening new camera
+      if (camVideo.srcObject) {
+        camVideo.srcObject.getTracks().forEach(t => t.stop());
+      }
+
+      // First try low-latency high-FPS constraints; fallback to {video:true} for strict DirectShow UVC cameras
+      let stream;
+      const primaryConstraints = {
+        audio: false,
+        video: deviceId
+          ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60, min: 30 } }
+          : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60, min: 30 } }
+      };
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(primaryConstraints);
+      } catch (cErr) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: deviceId ? { deviceId: { exact: deviceId } } : true
+        });
+      }
+
+      camVideo.srcObject = stream;
+      camVideo.classList.add('live');
+      usingRealWebcam = true;
+
+      // Explicitly play the visible <video> element so hardware GPU rendering starts immediately
+      await camVideo.play();
+      await refreshCameraDevices();
+
+      const track = stream.getVideoTracks()[0];
+      const settings = track ? track.getSettings() : {};
+      const vw = settings.width || camVideo.videoWidth || 640;
+      const vh = settings.height || camVideo.videoHeight || 480;
+      const vfps = settings.frameRate ? Math.round(settings.frameRate) : 30;
+      const camLabel = (track && track.label) ? track.label : 'USB UVC Camera';
+
+      // Clear canvas so native GPU <video> underneath shines through with 0ms lag, drawing only reticle
+      drawReticleOverlayOnly();
+
+      startUsbCamBtn.innerHTML = '<i class="fas fa-stop"></i> Stop USB Cam';
+      startUsbCamBtn.classList.remove('btn-primary');
+      document.getElementById('camModeHud').textContent = `LIVE GPU STREAM: ${camLabel} (${vw}x${vh} @ ${vfps}fps)`;
+      document.getElementById('connText').textContent = `USB CAM LIVE (${vw}x${vh})`;
+      logPacket('RX', 'CAMERA_USB', [0x4F, 0x4D, 0x4E, 0x49], `Live Hardware Camera Active: ${camLabel} (${vw}x${vh} @ ${vfps}fps)`);
+    } catch (err) {
+      logPacket('RX', 'CAMERA_USB', [0x45, 0x52, 0x52], 'Camera Access Error: ' + err.message);
+    }
+  }
+
+  startUsbCamBtn.addEventListener('click', async () => {
+    if (usingRealWebcam) {
+      stopRealUsbCamera();
+    } else {
+      await startRealUsbCamera(usbCamSelect.value);
+    }
   });
 
-  // Camera & Vision Canvas Engine (Synthetic Industrial Inspection + Real USB Webcam support)
-  const camCanvas = document.getElementById('camCanvas');
-  const camCtx = camCanvas.getContext('2d');
-  const camVideo = document.getElementById('camVideo');
-
-  document.getElementById('startUsbCamBtn').addEventListener('click', async () => {
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({video: {width: 640, height: 360}});
-        camVideo.srcObject = stream;
-        usingRealWebcam = true;
-        document.getElementById('camModeHud').textContent = 'MODE: LIVE USB / DIRECTSHOW WEBCAM';
-        logPacket('RX', 'CAMERA_USB', [0x4F, 0x4D, 0x4E, 0x49], 'Connected to Physical USB Camera Stream');
-      } catch (err) {
-        logPacket('RX', 'CAMERA_USB', [0x45, 0x52, 0x52], 'Camera Permission / Device Note: ' + err.message);
-      }
+  usbCamSelect.addEventListener('change', async () => {
+    if (usingRealWebcam) {
+      await startRealUsbCamera(usbCamSelect.value);
     }
   });
 
   document.getElementById('snapCamBtn').addEventListener('click', () => {
+    const snapCanvas = document.createElement('canvas');
+    const w = (usingRealWebcam && camVideo.videoWidth) ? camVideo.videoWidth : camCanvas.width;
+    const h = (usingRealWebcam && camVideo.videoHeight) ? camVideo.videoHeight : camCanvas.height;
+    snapCanvas.width = w;
+    snapCanvas.height = h;
+    const sCtx = snapCanvas.getContext('2d');
+    if (usingRealWebcam && camVideo.readyState >= 2) {
+      sCtx.drawImage(camVideo, 0, 0, w, h);
+      if (showReticle) sCtx.drawImage(camCanvas, 0, 0, w, h);
+    } else {
+      sCtx.drawImage(camCanvas, 0, 0, w, h);
+    }
     const a = document.createElement('a');
-    a.href = camCanvas.toDataURL('image/png');
+    a.href = snapCanvas.toDataURL('image/png');
     a.download = `omnicomm_frame_${camSeq}.png`;
     a.click();
     executeTransaction('QUERY');
@@ -925,22 +1248,37 @@ button,input,select,textarea{font-family:inherit;color:inherit}
 
   document.getElementById('camCrosshairBtn').addEventListener('click', () => {
     showReticle = !showReticle;
+    if (usingRealWebcam) drawReticleOverlayOnly();
   });
 
   camCanvas.addEventListener('mousemove', e => {
+    const now = performance.now();
+    if (now - lastMouseSampleTime < 65) return; // Throttle readback to prevent any GPU pipeline stall
+    lastMouseSampleTime = now;
+
     const r = camCanvas.getBoundingClientRect();
-    const x = Math.round((e.clientX - r.left) * (camCanvas.width / r.width));
-    const y = Math.round((e.clientY - r.top) * (camCanvas.height / r.height));
-    const px = camCtx.getImageData(Math.max(0, Math.min(639, x)), Math.max(0, Math.min(359, y)), 1, 1).data;
-    document.getElementById('camCursorHud').textContent = `XY: (${x}, ${y}) | RGB: (${px[0]}, ${px[1]}, ${px[2]})`;
+    const x = Math.max(0, Math.min(639, Math.round((e.clientX - r.left) * (640 / r.width))));
+    const y = Math.max(0, Math.min(359, Math.round((e.clientY - r.top) * (360 / r.height))));
+
+    if (usingRealWebcam && camVideo.readyState >= 2) {
+      const vw = camVideo.videoWidth || 640;
+      const vh = camVideo.videoHeight || 360;
+      const sx = Math.min(vw - 1, Math.round((e.clientX - r.left) * (vw / r.width)));
+      const sy = Math.min(vh - 1, Math.round((e.clientY - r.top) * (vh / r.height)));
+      sampleCtx.drawImage(camVideo, sx, sy, 1, 1, 0, 0, 1, 1);
+      const px = sampleCtx.getImageData(0, 0, 1, 1).data;
+      document.getElementById('camCursorHud').textContent = `XY: (${sx}, ${sy}) | RGB: (${px[0]}, ${px[1]}, ${px[2]})`;
+    } else {
+      const px = camCtx.getImageData(x, y, 1, 1).data;
+      document.getElementById('camCursorHud').textContent = `XY: (${x}, ${y}) | RGB: (${px[0]}, ${px[1]}, ${px[2]})`;
+    }
   });
 
   function renderCameraLoop(t) {
-    const w = camCanvas.width, h = camCanvas.height;
-    if (usingRealWebcam && camVideo.readyState >= 2) {
-      camCtx.drawImage(camVideo, 0, 0, w, h);
-    } else {
-      // Synthetic industrial microscopy / optical inspection surface
+    // When using real USB webcam, native GPU <video> element renders directly at full hardware FPS!
+    // No per-frame canvas copy is needed, eliminating all latency.
+    if (!usingRealWebcam && currentProto === 'CAMERA') {
+      const w = camCanvas.width, h = camCanvas.height;
       camCtx.fillStyle = '#070d19';
       camCtx.fillRect(0, 0, w, h);
 
@@ -969,24 +1307,25 @@ button,input,select,textarea{font-family:inherit;color:inherit}
       camCtx.fillStyle = '#10b981';
       camCtx.font = '11px JetBrains Mono';
       camCtx.fillText(`SPECIMEN_ROI Ø412.6µm [CONF 0.98]`, cx - 58, cy - 64);
-    }
 
-    if (showReticle) {
-      camCtx.strokeStyle = 'rgba(244,114,182,0.55)';
-      camCtx.lineWidth = 1;
-      camCtx.beginPath();
-      camCtx.moveTo(w / 2, 0); camCtx.lineTo(w / 2, h);
-      camCtx.moveTo(0, h / 2); camCtx.lineTo(w, h / 2);
-      camCtx.stroke();
-      camCtx.beginPath();
-      camCtx.arc(w / 2, h / 2, 36, 0, Math.PI * 2);
-      camCtx.stroke();
+      if (showReticle) {
+        camCtx.strokeStyle = 'rgba(244,114,182,0.55)';
+        camCtx.lineWidth = 1;
+        camCtx.beginPath();
+        camCtx.moveTo(w / 2, 0); camCtx.lineTo(w / 2, h);
+        camCtx.moveTo(0, h / 2); camCtx.lineTo(w, h / 2);
+        camCtx.stroke();
+        camCtx.beginPath();
+        camCtx.arc(w / 2, h / 2, 36, 0, Math.PI * 2);
+        camCtx.stroke();
+      }
     }
     requestAnimationFrame(renderCameraLoop);
   }
 
   // Initialize workbench
   renderRegisters();
+  refreshCameraDevices();
   selectProtocol('SCPI');
   executeTransaction('QUERY');
   requestAnimationFrame(renderCameraLoop);
