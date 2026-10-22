@@ -31,7 +31,7 @@ jobs:
 
       - name: Run Protocol Unit Tests
         run: |
-          pytest -v tests/
+          python -m pytest -v tests/
 
       - name: Run Multi-Protocol CLI Smoke Demo
         run: |
